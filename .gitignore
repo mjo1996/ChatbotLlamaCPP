@@ -1,3 +1,4 @@
 venv
 models/
 personalized_startup.md
+__pycache__/
