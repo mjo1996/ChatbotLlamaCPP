@@ -21,6 +21,7 @@ from pathlib import Path
 
 try:
     from llama_cpp import Llama
+    from llama_cpp import llama_chat_format
 except ImportError:
     sys.stderr.write(
         "Error: llama-cpp-python is not installed.\n"
@@ -116,6 +117,51 @@ def generate_reply(llm: Llama, messages: list[dict], temperature: float) -> str:
         return resp["choices"][0]["text"].strip()
 
 
+def str_to_bool(value: str) -> bool:
+    """Parse a human-friendly boolean such as ``true``/``false`` or ``on``/``off``."""
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on", "y"):
+        return True
+    if normalized in ("0", "false", "no", "off", "n"):
+        return False
+    raise ValueError(f"expected 'true' or 'false', got {value!r}")
+
+
+def argparse_bool(value: str) -> bool:
+    """argparse ``type=`` wrapper that reports bad booleans nicely."""
+    try:
+        return str_to_bool(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def install_thinking_control(llm: Llama) -> dict:
+    """Let the chat template's ``enable_thinking`` variable be toggled at runtime.
+
+    ``enable_thinking`` is the llama.cpp-compatible reasoning switch: chat
+    templates that support it (e.g. Qwen3) emit an empty reasoning block when it
+    is ``False`` and think normally when it is ``True`` or absent. Templates that
+    do not reference the variable simply ignore the extra argument.
+
+    Returns a state dict whose ``"enabled"`` key holds ``True`` (think), ``False``
+    (do not think) or ``None`` (leave the model's own default untouched).
+    """
+    base_handler = (
+        llm.chat_handler
+        or llm._chat_handlers.get(llm.chat_format)
+        or llama_chat_format.get_chat_completion_handler(llm.chat_format)
+    )
+    state: dict = {"enabled": None}
+
+    def handler_with_thinking(*args, **kwargs):
+        if state["enabled"] is not None:
+            kwargs["enable_thinking"] = state["enabled"]
+        return base_handler(*args, **kwargs)
+
+    llm.chat_handler = handler_with_thinking
+    return state
+
+
 def print_help() -> None:
     print(
         "\nCommands:\n"
@@ -125,6 +171,7 @@ def print_help() -> None:
         "  /history        Show messages in current chat\n"
         "  /save           Force-save the current chat\n"
         "  /temp <value>   Change temperature for subsequent replies\n"
+        "  /think <value>  Enable/disable thinking (true/false), or show current state\n"
         "  /help           Show this help\n"
         "  /exit, /quit    Exit the program\n"
     )
@@ -146,6 +193,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Sampling temperature. If omitted, you will be prompted.",
+    )
+    p.add_argument(
+        "--think",
+        type=argparse_bool,
+        default=None,
+        metavar="true|false",
+        help=(
+            "Enable or disable 'thinking' (reasoning) for models that offer both "
+            "modes, e.g. --think=false. Sets the chat template's enable_thinking "
+            "variable (llama.cpp-compatible); models whose template does not "
+            "define it are unaffected. Default: keep the model's own default."
+        ),
     )
     p.add_argument(
         "--gpu-layers",
@@ -204,7 +263,13 @@ def main() -> int:
     )
 
     print(f"\nLoading model: {model_path}")
-    print(f"  n_ctx={n_ctx}  temperature={temperature}  gpu_layers={args.gpu_layers}")
+    think_label = (
+        "model default" if args.think is None else ("on" if args.think else "off")
+    )
+    print(
+        f"  n_ctx={n_ctx}  temperature={temperature}  "
+        f"gpu_layers={args.gpu_layers}  thinking={think_label}"
+    )
 
     llm_kwargs = {
         "model_path": model_path,
@@ -216,6 +281,9 @@ def main() -> int:
         llm_kwargs["n_threads"] = args.threads
 
     llm = Llama(**llm_kwargs)
+
+    thinking = install_thinking_control(llm)
+    thinking["enabled"] = args.think
 
     ensure_history_dir()
     chat = new_chat(args.system)
@@ -283,6 +351,23 @@ def main() -> int:
                     print(f"Temperature set to {temperature}\n")
                 except ValueError:
                     print("Invalid temperature value.\n")
+            elif cmd == "/think":
+                if not arg:
+                    current = thinking["enabled"]
+                    shown = (
+                        "model default"
+                        if current is None
+                        else ("on" if current else "off")
+                    )
+                    print(f"Current thinking: {shown}\n")
+                    continue
+                try:
+                    thinking["enabled"] = str_to_bool(arg)
+                    print(
+                        f"Thinking {'enabled' if thinking['enabled'] else 'disabled'}\n"
+                    )
+                except ValueError as exc:
+                    print(f"{exc}\n")
             else:
                 print(f"Unknown command: {cmd}. Type /help for help.\n")
             continue
