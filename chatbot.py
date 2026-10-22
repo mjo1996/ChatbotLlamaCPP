@@ -4,6 +4,8 @@
 Features:
 - Loads a local .gguf model with llama-cpp-python (CPU by default).
 - User-configurable context length and temperature.
+- Replies are streamed to the terminal token by token as they are generated.
+- Reasoning ("thinking") is stripped from the stream, so only the answer shows.
 - Conversation history is fed back to the model for context.
 - Chats are persisted to disk as JSON files (can be disabled with /nohistory).
 - A new chat is opened by default; user can start a new chat at any time.
@@ -16,6 +18,7 @@ import json
 import os
 import sys
 import uuid
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 
@@ -98,23 +101,228 @@ def build_prompt(messages: list[dict]) -> str:
     return "\n".join(parts)
 
 
-def generate_reply(llm: Llama, messages: list[dict], temperature: float) -> str:
-    """Use llama.cpp's chat completion if available, else raw completion."""
+# The tags a reasoning model wraps its thinking in. Spelled in pieces so tools
+# that treat angle-bracket text as markup cannot mangle them in this file.
+THINK_OPEN_TAG = "<" + "think" + ">"
+THINK_CLOSE_TAG = "</" + "think" + ">"
+# Only announce thinking once a reasonable amount of it has been hidden, so an
+# empty thinking block (the shape Qwen3 emits when thinking is off) never
+# flickers a status message on screen.
+THINK_NOTICE_CHARS = 40
+
+
+class ThinkingStripper:
+    """Strip a leading reasoning block from a token stream.
+
+    Reasoning models wrap their reasoning in ``think`` tags that the chat
+    template opens *before* the answer, so the reasoning arrives interleaved in
+    the same text stream as the visible reply. This filter drops everything
+    between the tags and passes the rest through as soon as it is unambiguous,
+    which keeps streaming live instead of buffering the whole reply.
+
+    ``starts_inside`` covers the other half of the story: some templates (Qwen3
+    among them) open the reasoning block in the *prompt*, so the stream begins
+    mid-reasoning with no opening tag to spot and only the closing tag to end
+    it. See :func:`prompt_opens_thinking`.
+    """
+
+    def __init__(
+        self,
+        open_tag: str = THINK_OPEN_TAG,
+        close_tag: str = THINK_CLOSE_TAG,
+        starts_inside: bool = False,
+    ) -> None:
+        self._open = open_tag
+        self._close = close_tag
+        self._buffer = ""
+        self._decided = starts_inside
+        self.in_thinking = starts_inside
+        # Swallow the newlines a template puts between the reasoning and the
+        # answer, even when a chunk boundary lands right after the closing tag.
+        self._skip_space = starts_inside
+        self.hidden_chars = 0
+
+    def feed(self, text: str) -> str:
+        """Consume newly streamed ``text`` and return the visible part of it."""
+        if not text:
+            return ""
+        self._buffer += text
+        visible: list[str] = []
+        while self._buffer:
+            if self.in_thinking:
+                end = self._buffer.find(self._close)
+                if end == -1:
+                    # Keep a tail: the closing tag may straddle two chunks.
+                    keep = len(self._close) - 1
+                    self.hidden_chars += max(0, len(self._buffer) - keep)
+                    self._buffer = self._buffer[-keep:] if keep else ""
+                    break
+                self.hidden_chars += end + len(self._close)
+                self._buffer = self._buffer[end + len(self._close):].lstrip("\n")
+                self.in_thinking = False
+                self._skip_space = True
+                continue
+            if not self._decided:
+                stripped = self._buffer.lstrip()
+                if stripped.startswith(self._open):
+                    self._buffer = stripped[len(self._open):]
+                    self.in_thinking = True
+                    continue
+                if self._open.startswith(stripped):
+                    # Might still become the opening tag; wait for more tokens.
+                    break
+                self._decided = True
+                self._buffer = stripped
+            elif self._skip_space:
+                stripped = self._buffer.lstrip()
+                if not stripped:
+                    # Whitespace only so far: hold it back and wait.
+                    self._buffer = ""
+                    break
+                self._skip_space = False
+                self._buffer = stripped
+            visible.append(self._buffer)
+            self._buffer = ""
+        return "".join(visible)
+
+    def flush(self) -> str:
+        """Return whatever is left to print once the stream has ended."""
+        if self.in_thinking:
+            # An unterminated thinking block is all reasoning; drop it.
+            self._buffer = ""
+            return ""
+        tail, self._buffer = self._buffer, ""
+        return tail
+
+
+def prompt_opens_thinking(
+    llm: Llama, enabled: bool | None, messages: list[dict] | None = None
+) -> bool:
+    """Report whether the chat template leaves the prompt inside a think block.
+
+    Renders the model's own chat template, so the answer reflects what the model
+    is actually prompted with rather than a guess about where tags live. When
+    this is true, everything the model generates is reasoning until it emits the
+    closing tag, and the reasoning has no opening tag of its own to detect.
+    """
+    template = llm.metadata.get("tokenizer.chat_template")
+    if not template:
+        return False
     try:
-        resp = llm.create_chat_completion(
+        formatter = llama_chat_format.Jinja2ChatFormatter(
+            template=template,
+            eos_token="",
+            bos_token="",
+            stop_token_ids=[],
+        )
+        extra = {} if enabled is None else {"enable_thinking": enabled}
+        probe = messages or [{"role": "user", "content": "hi"}]
+        rendered = formatter(messages=probe, **extra).prompt
+    except Exception:
+        return False
+    return rendered.rstrip().endswith(THINK_OPEN_TAG)
+
+
+ASSISTANT_PROMPT = "Assistant: "
+
+
+def show_thinking_hint(active: bool) -> None:
+    """Signal that the model is reasoning, without printing the reasoning.
+
+    Written in place so the hint can be erased again as soon as the answer
+    starts. Only used on a real terminal: when output is redirected or piped,
+    the hint would just be noise in the captured text.
+    """
+    if not sys.stdout.isatty():
+        return
+    if active:
+        sys.stdout.write("(thinking...)")
+    else:
+        # Erase the hint and restore the prompt prefix.
+        sys.stdout.write(f"\r\033[K{ASSISTANT_PROMPT}")
+    sys.stdout.flush()
+
+
+def _iter_stream_text(stream: Iterator[dict], chat_completion: bool) -> Iterator[str]:
+    """Yield the text of each chunk of a llama.cpp completion stream."""
+    for chunk in stream:
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        if chat_completion:
+            delta = choice.get("delta") or {}
+            if delta.get("reasoning_content"):
+                # Some builds expose reasoning out-of-band; it is never shown.
+                continue
+            piece = delta.get("content") or ""
+        else:
+            piece = choice.get("text") or ""
+        if piece:
+            yield piece
+
+
+def generate_reply(
+    llm: Llama,
+    messages: list[dict],
+    temperature: float,
+    on_thinking: Callable[[bool], None] | None = None,
+    thinking: dict | None = None,
+) -> Iterator[str]:
+    """Stream the assistant's reply, with any reasoning stripped out.
+
+    Yields visible text chunks as they arrive. ``thinking`` is the state dict
+    from :func:`install_thinking_control`, used to tell whether the model was
+    prompted mid-reasoning. ``on_thinking`` is called with ``True``/``False`` as
+    a suppressed reasoning block starts and ends, so the caller can show a
+    status hint while the model thinks.
+    """
+    starts_inside = False
+    try:
+        stream = llm.create_chat_completion(
             messages=messages,
             temperature=temperature,
+            stream=True,
         )
-        return resp["choices"][0]["message"]["content"].strip()
+        chat_completion = True
     except Exception:
         prompt = build_prompt(messages)
-        resp = llm(
+        stream = llm(
             prompt,
             temperature=temperature,
             max_tokens=1024,
             stop=["<|im_end|>", "<|im_start|>"],
+            stream=True,
         )
-        return resp["choices"][0]["text"].strip()
+        chat_completion = False
+
+    if chat_completion and thinking is not None:
+        # The template may have opened the reasoning block in the prompt itself,
+        # in which case the whole run up to the closing tag is reasoning.
+        starts_inside = prompt_opens_thinking(llm, thinking["enabled"], messages)
+
+    stripper = ThinkingStripper(starts_inside=starts_inside)
+    announced = False
+    for piece in _iter_stream_text(stream, chat_completion):
+        visible = stripper.feed(piece)
+        if on_thinking is not None:
+            if (
+                stripper.in_thinking
+                and not announced
+                and stripper.hidden_chars >= THINK_NOTICE_CHARS
+            ):
+                announced = True
+                on_thinking(True)
+            elif announced and not stripper.in_thinking:
+                announced = False
+                on_thinking(False)
+        if visible:
+            yield visible
+    if announced and on_thinking is not None:
+        on_thinking(False)
+    tail = stripper.flush()
+    if tail:
+        yield tail
 
 
 def str_to_bool(value: str) -> bool:
@@ -410,17 +618,39 @@ def main() -> int:
 
         chat["messages"].append({"role": "user", "content": user_input})
 
+        sys.stdout.write(f"\n{ASSISTANT_PROMPT}")
+        sys.stdout.flush()
+        parts: list[str] = []
         try:
-            reply = generate_reply(llm, chat["messages"], temperature)
+            for piece in generate_reply(
+                llm,
+                chat["messages"],
+                temperature,
+                on_thinking=show_thinking_hint,
+                thinking=thinking,
+            ):
+                parts.append(piece)
+                sys.stdout.write(piece)
+                sys.stdout.flush()
+        except KeyboardInterrupt:
+            print("\n[generation interrupted]")
         except Exception as e:
-            print(f"[error generating reply: {e}]\n")
+            print(f"\n[error generating reply: {e}]")
             chat["messages"].pop()
+            continue
+
+        reply = "".join(parts).strip()
+        if not reply:
+            # Nothing visible came back: the model was still thinking when it
+            # stopped (context or token limit), or it produced no output at all.
+            chat["messages"].pop()
+            print("[no reply produced - the model stopped before answering]\n")
             continue
 
         chat["messages"].append({"role": "assistant", "content": reply})
         if save_enabled:
             save_chat(chat)
-        print(f"\nAssistant: {reply}\n")
+        print("\n")
 
     if save_enabled:
         save_chat(chat)

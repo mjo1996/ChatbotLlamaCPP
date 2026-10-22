@@ -6,6 +6,9 @@ A simple Python CLI chatbot that loads a local **GGUF** model via
 ## Features
 
 - Loads any local `.gguf` model.
+- **Replies stream to the terminal** as they are generated, token by token.
+- **Reasoning is never printed** — when the model thinks, the reasoning block is
+  filtered out of the stream and only the final answer is shown.
 - User-configurable **context length** (`n_ctx`) and **temperature**.
 - **CPU by default** (`--gpu-layers 0`); pass `--gpu-layers N` to offload.
 - **Thinking/reasoning can be toggled** (`--think true|false`) for models that
@@ -62,6 +65,11 @@ same switch llama.cpp's server exposes (`--chat-template-kwargs
 '{"enable_thinking": false}'`). Models whose chat template does not define that
 variable ignore it. If `--think` is omitted, the model's own default is used.
 You can also toggle it mid-session with `/think`.
+
+Either way the reasoning itself is **not printed**: while the model thinks, the
+reply line shows a `(thinking...)` hint (on a terminal only), and the answer
+starts streaming as soon as the model finishes thinking. Only the final answer —
+with no reasoning and no tag markers — is stored in the chat history.
 
 ## In-chat commands
 
