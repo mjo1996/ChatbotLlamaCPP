@@ -14,6 +14,8 @@ A simple Python CLI chatbot that loads a local **GGUF** model via
 - Conversation **history is sent back to the model** so it remembers context.
 - Chats are **persisted to disk** as JSON in `~/.chatbot_llamacpp/chats/`.
 - A **new chat is opened by default**; create more chats anytime with `/new`.
+- Saving can be **disabled at runtime** with `/nohistory`, or from the start
+  with `--no-history`.
 
 ## Install
 
@@ -32,6 +34,18 @@ You will be prompted for context length and temperature (or pass `--ctx` / `--te
 ```bash
 python chatbot.py -m model.gguf --ctx 4096 --temp 0.7
 ```
+
+### Disabling history
+
+By default chats are saved to `~/.chatbot_llamacpp/chats/`. To keep a session
+entirely off disk, start with `--no-history`:
+
+```bash
+python chatbot.py -m model.gguf --no-history
+```
+
+Nothing is written for the whole session (no new chat file is created). You can
+also toggle this at any time during a session with the `/nohistory` command.
 
 ### Thinking / reasoning
 
@@ -57,10 +71,15 @@ You can also toggle it mid-session with `/think`.
 /load <id>      Load a saved chat by id
 /history        Show messages in current chat
 /save           Force-save the current chat
+/nohistory      Toggle saving chats to disk (on/off)
 /temp <value>   Change temperature for subsequent replies
 /think <value>  Enable/disable thinking (true/false), or show current state
 /help           Show help
 /exit, /quit    Exit
 ```
 
-Chats are saved automatically after each assistant reply.
+Chats are saved automatically after each assistant reply. Use `/nohistory` to
+disable all saving to disk for the session — while disabled, no chat file is
+created or updated (existing saved chats are left untouched), and `/save` will
+refuse to write until saving is re-enabled. Run `/nohistory` again (or
+`/nohistory on`) to turn saving back on.

@@ -5,7 +5,7 @@ Features:
 - Loads a local .gguf model with llama-cpp-python (CPU by default).
 - User-configurable context length and temperature.
 - Conversation history is fed back to the model for context.
-- Chats are persisted to disk as JSON files.
+- Chats are persisted to disk as JSON files (can be disabled with /nohistory).
 - A new chat is opened by default; user can start a new chat at any time.
 """
 
@@ -170,6 +170,7 @@ def print_help() -> None:
         "  /load <id>      Load a saved chat by id\n"
         "  /history        Show messages in current chat\n"
         "  /save           Force-save the current chat\n"
+        "  /nohistory      Toggle saving chats to disk (on/off)\n"
         "  /temp <value>   Change temperature for subsequent replies\n"
         "  /think <value>  Enable/disable thinking (true/false), or show current state\n"
         "  /help           Show this help\n"
@@ -223,6 +224,14 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_SYSTEM_PROMPT,
         help="System prompt for new chats.",
+    )
+    p.add_argument(
+        "--no-history",
+        action="store_true",
+        help=(
+            "Start with history saving disabled: nothing is written to the chat "
+            "folder for the whole session. Toggle it at runtime with /nohistory."
+        ),
     )
     return p.parse_args()
 
@@ -285,10 +294,14 @@ def main() -> int:
     thinking = install_thinking_control(llm)
     thinking["enabled"] = args.think
 
-    ensure_history_dir()
+    save_enabled = not args.no_history
     chat = new_chat(args.system)
-    save_chat(chat)
+    if save_enabled:
+        ensure_history_dir()
+        save_chat(chat)
     print(f"\nStarted new chat: {chat['id']}")
+    if not save_enabled:
+        print("History saving is disabled (--no-history): nothing will be saved.")
     print("Type your message, or /help for commands.\n")
 
     while True:
@@ -311,7 +324,8 @@ def main() -> int:
                 print_help()
             elif cmd == "/new":
                 chat = new_chat(args.system)
-                save_chat(chat)
+                if save_enabled:
+                    save_chat(chat)
                 print(f"Started new chat: {chat['id']}\n")
             elif cmd == "/list":
                 chats = list_chats()
@@ -340,8 +354,30 @@ def main() -> int:
                     print(f"[{m['role']}] {m['content']}")
                 print()
             elif cmd == "/save":
-                save_chat(chat)
-                print(f"Saved to {chat_path(chat['id'])}\n")
+                if save_enabled:
+                    save_chat(chat)
+                    print(f"Saved to {chat_path(chat['id'])}\n")
+                else:
+                    print(
+                        "History saving is disabled (/nohistory); nothing written. "
+                        "Enable it first to save.\n"
+                    )
+            elif cmd == "/nohistory":
+                if not arg:
+                    save_enabled = not save_enabled
+                else:
+                    try:
+                        save_enabled = str_to_bool(arg)
+                    except ValueError as exc:
+                        print(f"{exc}\n")
+                        continue
+                if save_enabled:
+                    print("History saving enabled: chats will be written to disk.\n")
+                else:
+                    print(
+                        "History saving disabled: nothing will be written to the "
+                        "chat folder.\n"
+                    )
             elif cmd == "/temp":
                 if not arg:
                     print(f"Current temperature: {temperature}\n")
@@ -382,11 +418,15 @@ def main() -> int:
             continue
 
         chat["messages"].append({"role": "assistant", "content": reply})
-        save_chat(chat)
+        if save_enabled:
+            save_chat(chat)
         print(f"\nAssistant: {reply}\n")
 
-    save_chat(chat)
-    print(f"Chat saved: {chat_path(chat['id'])}")
+    if save_enabled:
+        save_chat(chat)
+        print(f"Chat saved: {chat_path(chat['id'])}")
+    else:
+        print("History saving disabled; chat not saved.")
     return 0
 
 
